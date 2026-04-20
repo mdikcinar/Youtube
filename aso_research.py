@@ -1,14 +1,22 @@
 """
 YouTube ASO Research Tool
 Bir konu/kelime için YouTube'da rekabet analizi ve aylık izlenme tahmini yapar.
-Kullanım: python aso_research.py "anahtar kelime"
+
+Kullanım:
+  python aso_research.py "anahtar kelime"
+  python aso_research.py "anahtar kelime" --cookies-from-browser chrome
+  python aso_research.py "anahtar kelime" --demo
 """
 
 import sys
 import time
-from datetime import datetime, timezone
+import random
+from datetime import datetime, timezone, timedelta
+import urllib3
 import yt_dlp
 from pytrends.request import TrendReq
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
@@ -25,13 +33,26 @@ def format_views(count: int) -> str:
     return str(count)
 
 
-def search_youtube(keyword: str, max_results: int = 10) -> list[dict]:
+YDL_BASE = {
+    "quiet": True,
+    "no_warnings": True,
+    "skip_download": True,
+    "nocheckcertificate": True,
+}
+
+
+def _make_ydl_opts(cookies_browser: str | None = None) -> dict:
+    opts = {**YDL_BASE}
+    if cookies_browser:
+        opts["cookiesfrombrowser"] = (cookies_browser,)
+    return opts
+
+
+def search_youtube(keyword: str, max_results: int = 10, cookies_browser: str | None = None) -> list[dict]:
     """yt-dlp ile YouTube arama yapar, her video için metadata döner."""
     ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
+        **_make_ydl_opts(cookies_browser),
         "extract_flat": True,
-        "skip_download": True,
         "playlistend": max_results,
     }
     url = f"ytsearch{max_results}:{keyword}"
@@ -44,13 +65,46 @@ def search_youtube(keyword: str, max_results: int = 10) -> list[dict]:
     return videos
 
 
-def get_video_details(video_ids: list[str]) -> dict[str, dict]:
+def _demo_videos(keyword: str, count: int = 10) -> tuple[list[dict], dict[str, dict]]:
+    """Gerçek ağ erişimi olmayan ortamlar için örnek veri üretir."""
+    rng = random.Random(keyword)
+    channels = [
+        "TechTürk", "CodeAkademi", "PythonTR", "DevHocası",
+        "YazılımOkulu", "KodlamaZamanı", "BilgisayarBilimi", "AlgoTürk",
+        "ProgramlamaKlubu", "DigitalMentor",
+    ]
+    raw_videos = []
+    details: dict[str, dict] = {}
+    base_date = datetime(2023, 1, 1, tzinfo=timezone.utc)
+
+    for i in range(count):
+        vid_id = f"demo_{i:03d}"
+        days_ago = rng.randint(30, 900)
+        upload_dt = (datetime.now(tz=timezone.utc) - timedelta(days=days_ago))
+        upload_date = upload_dt.strftime("%Y%m%d")
+        view_count = rng.randint(5_000, 2_000_000)
+        raw_videos.append({
+            "id": vid_id,
+            "title": f"{keyword.title()} {'Nasıl Yapılır' if i % 3 == 0 else 'Nedir' if i % 3 == 1 else 'Öğren'} — {i + 1}. Ders",
+            "channel": channels[i % len(channels)],
+            "uploader": channels[i % len(channels)],
+        })
+        details[vid_id] = {
+            "view_count": view_count,
+            "upload_date": upload_date,
+            "like_count": int(view_count * rng.uniform(0.02, 0.08)),
+            "comment_count": int(view_count * rng.uniform(0.003, 0.01)),
+            "duration": rng.randint(300, 3600),
+            "channel": channels[i % len(channels)],
+            "subscriber_count": rng.randint(1_000, 500_000),
+            "tags": [keyword, f"{keyword} dersleri", "programlama", "eğitim", "türkçe"][:rng.randint(2, 5)],
+        }
+    return raw_videos, details
+
+
+def get_video_details(video_ids: list[str], cookies_browser: str | None = None) -> dict[str, dict]:
     """yt-dlp ile her video için tam metadata çeker."""
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-    }
+    ydl_opts = _make_ydl_opts(cookies_browser)
     details: dict[str, dict] = {}
     for vid_id in video_ids:
         url = f"https://www.youtube.com/watch?v={vid_id}"
@@ -90,7 +144,7 @@ def calculate_monthly_views(view_count: int, upload_date_str: str | None) -> int
 def get_trends_score(keyword: str) -> int | None:
     """Google Trends'den 0-100 arası ilgi skoru döner (TR, son 3 ay)."""
     try:
-        pytrends = TrendReq(hl="tr-TR", tz=180, timeout=(10, 25))
+        pytrends = TrendReq(hl="tr-TR", tz=180, timeout=(10, 25), requests_args={"verify": False})
         pytrends.build_payload([keyword], cat=0, timeframe="today 3-m", geo="TR")
         data = pytrends.interest_over_time()
         if data.empty or keyword not in data.columns:
@@ -103,7 +157,7 @@ def get_trends_score(keyword: str) -> int | None:
 def get_related_queries(keyword: str) -> list[str]:
     """Google Trends ile ilgili sorguları getirir."""
     try:
-        pytrends = TrendReq(hl="tr-TR", tz=180, timeout=(10, 25))
+        pytrends = TrendReq(hl="tr-TR", tz=180, timeout=(10, 25), requests_args={"verify": False})
         pytrends.build_payload([keyword], cat=0, timeframe="today 3-m", geo="TR")
         related = pytrends.related_queries()
         top = related.get(keyword, {}).get("top")
@@ -133,25 +187,46 @@ def calc_opportunity(avg_monthly: int, trend_score: int | None) -> int:
     return min(100, int(view_score * 0.65 + t * 0.35))
 
 
-def analyze_keyword(keyword: str, max_videos: int = 10) -> None:
+def analyze_keyword(
+    keyword: str,
+    max_videos: int = 10,
+    cookies_browser: str | None = None,
+    demo: bool = False,
+) -> None:
+    mode_label = "[dim](demo modu)[/dim]" if demo else ""
     console.print(Panel(
-        f"[bold cyan]YouTube ASO Analizi[/bold cyan]\nAnahtar kelime: [yellow]{keyword}[/yellow]",
+        f"[bold cyan]YouTube ASO Analizi[/bold cyan] {mode_label}\nAnahtar kelime: [yellow]{keyword}[/yellow]",
         expand=False,
     ))
 
-    # 1. YouTube'da arama
-    console.print("\n[bold]YouTube'da arama yapılıyor...[/bold]")
-    raw_videos = search_youtube(keyword, max_videos)
-    if not raw_videos:
-        console.print("[red]Sonuç bulunamadı.[/red]")
-        return
+    if demo:
+        console.print("\n[bold yellow]Demo modu — örnek verilerle çalışıyor.[/bold yellow]")
+        raw_videos, details = _demo_videos(keyword, max_videos)
+    else:
+        # 1. YouTube'da arama
+        console.print("\n[bold]YouTube'da arama yapılıyor...[/bold]")
+        try:
+            raw_videos = search_youtube(keyword, max_videos, cookies_browser)
+        except Exception as e:
+            console.print(f"[red]YouTube araması başarısız: {e}[/red]")
+            console.print(
+                "\n[yellow]İpucu:[/yellow] Tarayıcı cookie'si ile deneyin:\n"
+                f"  python aso_research.py \"{keyword}\" --cookies-from-browser chrome\n"
+                "Ya da demo modunda test edin:\n"
+                f"  python aso_research.py \"{keyword}\" --demo"
+            )
+            return
 
-    video_ids = [v["id"] for v in raw_videos if v.get("id")]
-    console.print(f"  [dim]{len(video_ids)} video bulundu.[/dim]")
+        if not raw_videos:
+            console.print("[red]Sonuç bulunamadı.[/red]")
+            return
 
-    # 2. Her video için tam detay
-    console.print("[bold]Detaylı metadata çekiliyor...[/bold]")
-    details = get_video_details(video_ids)
+        video_ids = [v["id"] for v in raw_videos if v.get("id")]
+        console.print(f"  [dim]{len(video_ids)} video bulundu.[/dim]")
+
+        # 2. Her video için tam detay
+        console.print("[bold]Detaylı metadata çekiliyor...[/bold]")
+        details = get_video_details(video_ids, cookies_browser)
 
     # 3. Veri birleştir + aylık izlenme hesapla
     videos = []
@@ -262,5 +337,16 @@ def analyze_keyword(keyword: str, max_videos: int = 10) -> None:
 
 
 if __name__ == "__main__":
-    keyword = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else "python programlama"
-    analyze_keyword(keyword)
+    args = sys.argv[1:]
+    demo_mode = "--demo" in args
+    if demo_mode:
+        args.remove("--demo")
+
+    browser = None
+    if "--cookies-from-browser" in args:
+        idx = args.index("--cookies-from-browser")
+        args.pop(idx)
+        browser = args.pop(idx) if idx < len(args) else "chrome"
+
+    keyword = " ".join(args) if args else "python programlama"
+    analyze_keyword(keyword, cookies_browser=browser, demo=demo_mode)
