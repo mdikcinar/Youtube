@@ -1,0 +1,5 @@
+youtube-search-python
+yt-dlp
+pytrends
+requests
+rich
